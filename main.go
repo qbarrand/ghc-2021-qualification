@@ -6,7 +6,10 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 )
 
@@ -48,15 +51,75 @@ func main() {
 	wg.Wait()
 }
 
+type (
+	Output           = map[int]Intersection
+	Intersection     map[string]*IntersectionItem
+	IntersectionItem struct {
+		GreenTime int
+		Weight    float64 // number of cars going through the intersection
+	}
+)
+
+func (i Intersection) CalculateGreenTimes(maxDuration int) {
+	lowest := math.MaxFloat64
+
+	for _, item := range i {
+		if item.Weight < lowest {
+			lowest = item.Weight
+		}
+	}
+
+	lowest *= 3
+
+	for _, item := range i {
+		//item.GreenTime = int(
+		//	math.Min(
+		//		math.Max(math.Floor(item.Weight/lowest), 1),
+		//		float64(maxDuration),
+		//	),
+		//)
+
+		item.GreenTime = 2
+	}
+}
+
 func process(in, outdir string, logger *log.Logger) {
 	sim, err := Parse(in)
 	if err != nil {
 		logger.Fatalf("Failed to parse %s: %v", in, err)
 	}
 
-	logger.Printf("%s: %+v", in, sim)
+	// Remove cars that won't make it
+	//sim.RemoveCarPercent(80)
 
-	_ = sim
+	usedStreets := sim.UsedStreets()
+
+	output := make(Output)
+
+	for streetName, street := range sim.Streets {
+		weight := usedStreets[streetName]
+
+		if weight == 0 {
+			//logger.Printf("%s: discarding street %s", in, streetName)
+			continue
+		}
+
+		if output[street.End] == nil {
+			output[street.End] = make(Intersection)
+		}
+
+		output[street.End][streetName] = &IntersectionItem{Weight: weight}
+	}
+
+	for _, intersection := range output {
+		intersection.CalculateGreenTimes(sim.Duration)
+	}
+
+	outFile := filepath.Join(outdir, filepath.Base(in))
+
+	if err := WriteOutput(outFile, output); err != nil {
+		logger.Fatalf("Could not write %s: %v", outFile, err)
+	}
 }
 
 func Parse(in string) (*Simulation, error) {
@@ -66,6 +129,7 @@ func Parse(in string) (*Simulation, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer fd.Close()
 
 	var (
 		streets int
@@ -76,7 +140,7 @@ func Parse(in string) (*Simulation, error) {
 		return nil, fmt.Errorf("could not parse header: %v", err)
 	}
 
-	s.CarPaths = make([][]string, 0, cars)
+	s.CarPaths = make([]CarPath, 0, cars)
 	s.Streets = make(map[string]*Street, streets)
 
 	for i := 0; i < streets; i++ {
@@ -115,12 +179,78 @@ func Parse(in string) (*Simulation, error) {
 	return &s, nil
 }
 
+func WriteOutput(filename string, output Output) error {
+	fd, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+
+	fmt.Fprintf(fd, "%d\n", len(output))
+
+	for intersectionID, intersection := range output {
+		// Write the intersection ID
+		fmt.Fprintf(fd, "%d\n%d\n", intersectionID, len(intersection))
+
+		for streetName, item := range intersection {
+			fmt.Fprintf(fd, "%s %d\n", streetName, item.GreenTime)
+		}
+	}
+
+	return nil
+}
+
+type Streets map[string]*Street
+
 type Simulation struct {
 	Duration      int
 	Intersections int
-	Streets       map[string]*Street
-	CarPaths      [][]string
+	Streets       Streets
+	CarPaths      []CarPath
 	Bonus         int
+}
+
+func (s *Simulation) RemoveCarPercent(pc int) {
+	// Sort the cars by profit
+	sort.Slice(s.CarPaths, func(i, j int) bool {
+		return s.Duration-s.CarPaths[i].Deadline(s.Streets) < s.Duration-s.CarPaths[j].Deadline(s.Streets)
+	})
+
+	elemsToRemove := (float64(pc) / 100) * float64(len(s.CarPaths))
+
+	log.Printf("Removing %f elems from %d cars", elemsToRemove, len(s.CarPaths))
+
+	s.CarPaths = s.CarPaths[int(elemsToRemove):]
+}
+
+type CarPath []string
+
+func (s *Simulation) UsedStreets() map[string]float64 {
+	used := make(map[string]float64)
+
+	for _, carPath := range s.CarPaths {
+		for _, streetName := range carPath {
+			used[streetName]++
+		}
+	}
+
+	return used
+}
+
+func (s *Simulation) UsedStreetsDividedByTime() map[string]float64 {
+	used := make(map[string]float64)
+
+	for _, carPath := range s.CarPaths {
+		for _, streetName := range carPath {
+			used[streetName]++
+		}
+	}
+
+	for streetName, ncars := range used {
+		used[streetName] = ncars / float64(s.Streets[streetName].Time)
+	}
+
+	return used
 }
 
 type Street struct {
@@ -128,4 +258,14 @@ type Street struct {
 	End   int
 	Name  string
 	Time  int
+}
+
+func (c CarPath) Deadline(streets Streets) int {
+	deadline := 0
+
+	for _, s := range c[1:] { // skip the first street
+		deadline += streets[s].Time
+	}
+
+	return deadline
 }
